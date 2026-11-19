@@ -14,7 +14,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/go/packages/packagestest"
 )
 
 func TestProcess(t *testing.T) {
@@ -54,19 +53,20 @@ func TestProcess(t *testing.T) {
 			}
 
 			originalFile := filepath.Join(dir, "original.go")
-			e := packagestest.Export(t, packagestest.Modules, []packagestest.Module{
+			cfg, err := exportModules(t, []testModule{
 				crawshawModule,
 				bassModule,
 				sqliteModule,
 				{
 					Name: mainPkgPath,
-					Files: map[string]any{
-						mainFilename: packagestest.Copy(originalFile),
+					Files: map[string]string{
+						mainFilename: originalFile,
 					},
 				},
 			})
-			cfg := new(packages.Config)
-			*cfg = *e.Config
+			if err != nil {
+				t.Fatal(err)
+			}
 			cfg.Mode = processMode
 			pkgs, err := packages.Load(cfg, "pattern="+mainPkgPath)
 			if err != nil {
@@ -102,10 +102,79 @@ func TestProcess(t *testing.T) {
 	}
 }
 
-func skeletonModule(importPath string) (packagestest.Module, error) {
-	mod := packagestest.Module{
+type testModule struct {
+	Name  string
+	Files map[string]string
+}
+
+func exportModules(t *testing.T, modules []testModule) (*packages.Config, error) {
+	t.Helper()
+	if len(modules) == 0 {
+		return nil, fmt.Errorf("no modules to export")
+	}
+	rootDir := t.TempDir()
+	mainModule := modules[len(modules)-1]
+	mainDir := filepath.Join(rootDir, "main")
+	if err := writeTestModule(mainDir, mainModule); err != nil {
+		return nil, err
+	}
+
+	var goMod strings.Builder
+	fmt.Fprintf(&goMod, "module %s\n\ngo 1.20\n\nrequire (\n", mainModule.Name)
+	for _, mod := range modules[:len(modules)-1] {
+		fmt.Fprintf(&goMod, "\t%s v0.0.0\n", mod.Name)
+	}
+	goMod.WriteString(")\n\n")
+	for i, mod := range modules[:len(modules)-1] {
+		fmt.Fprintf(&goMod, "replace %s => ../module-%d\n", mod.Name, i)
+	}
+	if err := os.WriteFile(filepath.Join(mainDir, "go.mod"), []byte(goMod.String()), 0644); err != nil {
+		return nil, err
+	}
+	for i, mod := range modules[:len(modules)-1] {
+		if err := writeTestModule(filepath.Join(rootDir, fmt.Sprintf("module-%d", i)), mod); err != nil {
+			return nil, err
+		}
+	}
+
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, item := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(item), "GOWORK=") {
+			env = append(env, item)
+		}
+	}
+	env = append(env, "GOWORK=off")
+	return &packages.Config{Dir: mainDir, Env: env}, nil
+}
+
+func writeTestModule(dir string, mod testModule) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	goMod := fmt.Sprintf("module %s\n\ngo 1.20\n", mod.Name)
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		return err
+	}
+	for relPath, sourcePath := range mod.Files {
+		data, err := os.ReadFile(sourcePath)
+		if err != nil {
+			return fmt.Errorf("read module %q file %q: %w", mod.Name, relPath, err)
+		}
+		dst := filepath.Join(dir, filepath.FromSlash(relPath))
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, data, 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func skeletonModule(importPath string) (testModule, error) {
+	mod := testModule{
 		Name:  importPath,
-		Files: make(map[string]any),
+		Files: make(map[string]string),
 	}
 	dir := filepath.Join("testdata", "skeleton", filepath.FromSlash(importPath))
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -116,11 +185,11 @@ func skeletonModule(importPath string) (packagestest.Module, error) {
 			return nil
 		}
 		relpath := strings.TrimPrefix(path, dir+string(filepath.Separator))
-		mod.Files[filepath.ToSlash(relpath)] = packagestest.Copy(path)
+		mod.Files[filepath.ToSlash(relpath)] = path
 		return nil
 	})
 	if err != nil {
-		return packagestest.Module{}, fmt.Errorf("load skeleton module %q: %w", importPath, err)
+		return testModule{}, fmt.Errorf("load skeleton module %q: %w", importPath, err)
 	}
 	return mod, nil
 }
